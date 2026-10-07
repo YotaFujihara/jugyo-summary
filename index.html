@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a73e8">
+<title>授業文字起こし</title>
+<style>
+  :root {
+    --bg: #f6f6f3; --card: #ffffff; --fg: #1d1d1f; --muted: #6b6b6b;
+    --line: #e0e0dc; --interim: #8c8c8c; --interim-bg: #eef3fd;
+    --start: #1a73e8; --stop: #d93025; --mark: #9a9a9a;
+    --fs: 20px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121212; --card: #1d1d1d; --fg: #ececec; --muted: #a0a0a0;
+      --line: #333333; --interim: #8f8f8f; --interim-bg: #1f2a3c;
+      --start: #1a73e8; --stop: #c5221f; --mark: #777777;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Noto Sans JP", "Hiragino Sans", sans-serif;
+    display: flex; flex-direction: column; height: 100dvh;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px; background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  #status { flex: 1; display: flex; align-items: center; gap: 8px; font-size: 15px; color: var(--muted); min-width: 0; }
+  #status span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--muted); }
+  body.recording .dot { background: var(--stop); animation: blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  #count { font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .icon-btn {
+    min-width: 44px; height: 44px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--fg); font-size: 16px; font-weight: 600;
+  }
+
+  #log {
+    flex: 1; overflow-y: auto; padding: 16px; font-size: var(--fs); line-height: 1.8;
+    white-space: pre-wrap; word-break: break-word; overscroll-behavior: contain;
+  }
+  #final:empty + #interim:empty::before {
+    content: "「録音開始」を押すと、ここに文字起こしが表示されます。";
+    color: var(--muted); font-size: 16px;
+  }
+  #interim {
+    display: block; color: var(--interim); background: var(--interim-bg);
+    border-left: 4px solid var(--start); padding: 2px 8px; margin-top: 4px; border-radius: 4px;
+  }
+  #interim:empty { display: none; }
+  .mark { color: var(--mark); font-size: .75em; }
+
+  footer {
+    background: var(--card); border-top: 1px solid var(--line);
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    display: grid; gap: 10px;
+  }
+  .row { display: grid; gap: 10px; }
+  .row.main { grid-template-columns: 2fr 1fr; }
+  .row.sub { grid-template-columns: 1fr 1fr 1fr; }
+  button { font-family: inherit; cursor: pointer; touch-action: manipulation; }
+  button:disabled { opacity: .35; }
+  .big {
+    height: 76px; border: none; border-radius: 18px; color: #fff;
+    font-size: 22px; font-weight: 700; letter-spacing: .05em;
+  }
+  #startBtn { background: var(--start); }
+  #stopBtn { background: var(--stop); }
+  .sub button {
+    height: 56px; border-radius: 14px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--fg); font-size: 15px; font-weight: 600;
+  }
+
+  #toast {
+    position: fixed; left: 50%; bottom: calc(190px + env(safe-area-inset-bottom));
+    transform: translateX(-50%); background: rgba(0,0,0,.82); color: #fff;
+    padding: 10px 18px; border-radius: 999px; font-size: 15px;
+    opacity: 0; pointer-events: none; transition: opacity .2s; max-width: calc(100% - 32px);
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <header>
+    <div id="status"><div class="dot"></div><span id="statusText">待機中</span></div>
+    <div id="count">0文字</div>
+    <button class="icon-btn" id="fontDown" aria-label="文字を小さく">A−</button>
+    <button class="icon-btn" id="fontUp" aria-label="文字を大きく">A＋</button>
+  </header>
+
+  <main id="log"><span id="final"></span><span id="interim"></span></main>
+
+  <footer>
+    <div class="row main">
+      <button class="big" id="startBtn">● 録音開始</button>
+      <button class="big" id="stopBtn" disabled>■ 停止</button>
+    </div>
+    <div class="row sub">
+      <button id="copyBtn">全文コピー</button>
+      <button id="saveBtn">テキスト保存</button>
+      <button id="clearBtn">クリア</button>
+    </div>
+  </footer>
+
+  <div id="toast" role="status"></div>
+
+<script>
+(() => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const TEXT_KEY = 'lecture-transcript:text';
+  const FONT_KEY = 'lecture-transcript:font';
+
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('log'), finalEl = $('final'), interimEl = $('interim');
+  const startBtn = $('startBtn'), stopBtn = $('stopBtn'), clearBtn = $('clearBtn');
+
+  // ---- 状態 ----
+  let committed = storageGet(TEXT_KEY) || ''; // 確定済み（前回までのセッション分）
+  let sessionFinals = [];  // 現在の認識セッションで確定した結果（インデックスごと）
+  let interim = '';        // 認識途中のテキスト
+  let recording = false;   // ユーザーが録音中にしているか
+  let running = false;     // 認識エンジンが実際に動いているか
+  let rec = null;
+  let wakeLock = null;
+  let restartTimer = null;
+  let failCount = 0;       // 連続で即終了した回数（再開の間隔調整用）
+  let sessionStartedAt = 0;
+
+  // ---- localStorage（使えない環境でも動くように） ----
+  function storageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+  function storageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+  // ---- テキスト組み立て ----
+  // Android版Chromeでは確定結果が前の結果を含んで重複することがあるため、前方一致なら置き換える
+  function sessionText() {
+    const out = [];
+    for (const t of sessionFinals) {
+      if (!t) continue;
+      const prev = out[out.length - 1];
+      if (prev && t.startsWith(prev)) out[out.length - 1] = t;
+      else if (prev && prev.startsWith(t)) continue;
+      else out.push(t);
+    }
+    return out.join('\n');
+  }
+  function join(a, b) { return a && b ? a + '\n' + b : a + b; }
+  function fullText() { return join(committed, sessionText()); }
+
+  function save() { storageSet(TEXT_KEY, fullText()); }
+
+  function render() {
+    const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80;
+    const text = fullText();
+    finalEl.textContent = text;
+    interimEl.textContent = interim;
+    $('count').textContent = text.replace(/\s/g, '').length.toLocaleString() + '文字';
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function commitSession() {
+    let s = sessionText();
+    if (interim) s = join(s, interim); // 途中で切れた分も捨てずに残す
+    committed = join(committed, s);
+    sessionFinals = [];
+    interim = '';
+    save();
+    render();
+  }
+
+  function setStatus(msg) { $('statusText').textContent = msg; }
+
+  function updateButtons() {
+    startBtn.disabled = recording || !SR;
+    stopBtn.disabled = !recording;
+    clearBtn.disabled = recording;
+    document.body.classList.toggle('recording', recording);
+  }
+
+  // ---- 音声認識 ----
+  function startRecognition() {
+    clearTimeout(restartTimer);
+    if (!recording || running) return;
+
+    rec = new SR();
+    rec.lang = 'ja-JP';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+
+    rec.onstart = () => {
+      running = true;
+      sessionStartedAt = Date.now();
+      setStatus('録音中…');
+    };
+
+    rec.onresult = (e) => {
+      let inter = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        const t = r[0].transcript.trim();
+        if (r.isFinal) sessionFinals[i] = t;
+        else inter += t;
+      }
+      interim = inter;
+      failCount = 0;
+      save();
+      render();
+    };
+
+    rec.onerror = (e) => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        recording = false;
+        setStatus('マイクが許可されていません');
+        toast('ブラウザの設定でマイクを許可してください');
+        updateButtons();
+        releaseWakeLock();
+      } else if (e.error === 'network') {
+        setStatus('ネットワークエラー。再接続中…');
+        failCount++;
+      } else if (e.error === 'audio-capture') {
+        setStatus('マイクが見つかりません');
+        failCount++;
+      }
+      // no-speech / aborted などは onend で自動再開
+    };
+
+    rec.onend = () => {
+      running = false;
+      commitSession();
+      if (!recording) { setStatus('停止しました'); return; }
+      // すぐ終了を繰り返す場合は間隔を空ける（最大3秒）
+      if (Date.now() - sessionStartedAt < 1000) failCount++;
+      const delay = Math.min(250 + failCount * 500, 3000);
+      setStatus('再開中…');
+      restartTimer = setTimeout(startRecognition, delay);
+    };
+
+    try {
+      rec.start();
+    } catch (err) {
+      running = false;
+      restartTimer = setTimeout(startRecognition, 500);
+    }
+  }
+
+  function timeLabel() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  function start() {
+    if (!SR || recording) return;
+    recording = true;
+    failCount = 0;
+    committed = join(committed, `――― ${new Date().toLocaleDateString('ja-JP')} ${timeLabel()} 開始 ―――`);
+    save();
+    render();
+    updateButtons();
+    setStatus('開始しています…');
+    requestWakeLock();
+    startRecognition();
+  }
+
+  function stop() {
+    recording = false;
+    clearTimeout(restartTimer);
+    updateButtons();
+    releaseWakeLock();
+    if (rec && running) {
+      try { rec.stop(); } catch {}
+    } else {
+      setStatus('停止しました');
+    }
+  }
+
+  // ---- Wake Lock（録音中に画面をスリープさせない） ----
+  async function requestWakeLock() {
+    if (!('wakeLock' in navigator) || wakeLock) return;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch (err) {
+      // 省電力モードなどで拒否されることがある
+    }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+
+  // 画面を離れると Wake Lock と認識が止まるので、戻ったら再取得・再開する
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && recording) {
+      requestWakeLock();
+      if (!running) { failCount = 0; startRecognition(); }
+    } else if (document.visibilityState === 'hidden') {
+      save();
+    }
+  });
+  window.addEventListener('pagehide', save);
+
+  // ---- コピー・保存・クリア ----
+  async function copyAll() {
+    const text = fullText();
+    if (!text) { toast('テキストがありません'); return; }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    toast('全文をコピーしました');
+  }
+
+  function saveFile() {
+    const text = fullText();
+    if (!text) { toast('テキストがありません'); return; }
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const name = `授業_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}.txt`;
+    const blob = new Blob(['﻿' + text.replace(/\n/g, '\r\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('保存しました：' + name);
+  }
+
+  function clearAll() {
+    if (recording) return;
+    if (!fullText()) return;
+    if (!confirm('文字起こしをすべて消去します。よろしいですか？\n（先に保存しておくことをおすすめします）')) return;
+    committed = ''; sessionFinals = []; interim = '';
+    save();
+    render();
+    toast('消去しました');
+  }
+
+  // ---- 文字サイズ ----
+  let fontSize = parseInt(storageGet(FONT_KEY), 10) || 20;
+  function applyFont() {
+    document.documentElement.style.setProperty('--fs', fontSize + 'px');
+    storageSet(FONT_KEY, String(fontSize));
+  }
+  $('fontUp').onclick = () => { fontSize = Math.min(fontSize + 2, 36); applyFont(); };
+  $('fontDown').onclick = () => { fontSize = Math.max(fontSize - 2, 14); applyFont(); };
+
+  // ---- トースト ----
+  let toastTimer;
+  function toast(msg) {
+    const el = $('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+  }
+
+  // ---- 初期化 ----
+  startBtn.onclick = start;
+  stopBtn.onclick = stop;
+  $('copyBtn').onclick = copyAll;
+  $('saveBtn').onclick = saveFile;
+  clearBtn.onclick = clearAll;
+
+  applyFont();
+  render();
+  logEl.scrollTop = logEl.scrollHeight;
+  updateButtons();
+  if (!SR) setStatus('このブラウザは音声認識に未対応です（Chromeで開いてください）');
+  else if (!window.isSecureContext) setStatus('https で開いてください（マイクが使えません）');
+})();
+</script>
+</body>
+</html>
